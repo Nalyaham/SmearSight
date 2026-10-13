@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SmearSight</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="app">
+  <nav class="side">
+    <div class="brand">SmearSight<small>TB smear reading assistant</small></div>
+    <a href="#/" data-r="">Dashboard</a>
+    <a href="#/analyze" data-r="analyze">Analyze slide</a>
+    <a href="#/review" data-r="review">Expert review <span class="badge" id="rv-badge" hidden>0</span></a>
+    <a href="#/dataset" data-r="dataset">Dataset</a>
+    <a href="#/training" data-r="training">Model training</a>
+    <a href="#/performance" data-r="performance">Performance</a>
+    <a href="#/settings" data-r="settings">Settings and audit</a>
+    <div class="grow"></div>
+    <div class="who">Working as
+      <select id="reader"></select>
+      <div id="model-chip" style="margin-top:8px"></div>
+    </div>
+  </nav>
+  <main id="view"></main>
+</div>
+<script src="/static/app.js"></script>
+<script src="/static/pages.js"></script>
+<script src="/static/pages2.js"></script>
+<script>boot();</script>
+</body>
+</html>
