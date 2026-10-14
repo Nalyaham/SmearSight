@@ -1,12 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 Django>=4.2,<6
 djangorestframework>=3.15
 whitenoise>=6.6
 waitress>=3.0
-numpy<2
-opencv-python-headless<4.12
+numpy
+opencv-python-headless
 pillow
 ultralytics>=8.3
 psutil
-torch==2.2.2
-torchvision==0.17.2
-contourpy<1.4
