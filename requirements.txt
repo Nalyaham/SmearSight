@@ -7,4 +7,5 @@ numpy
 opencv-python-headless
 pillow
 ultralytics>=8.3
-psutilsegno>=1.6
+psutil
+segno>=1.6
