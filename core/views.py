@@ -17,9 +17,12 @@ from . import models as M
 from . import serializers as S
 from .api_common import (ApiError, api_exception_handler, audit, counted, fail, reader_name, reader_role)  # noqa: F401
 from .middleware import token
-from .services import datasets, grading, imaging, inference, synth
-from .services.config import CONF_FLOOR, CONF_POSITIVE, CONF_REVIEW, STATIC_DIR, pin
+from .services import confirm, datasets, grading, imaging, inference, settings_store, synth
+from .services.acquisition import add_field_images
+from .services.config import STATIC_DIR, pin
+from .services.network import lan_enabled, lan_ip
 
+VERSION = "2.0"
 DEMO_BANNER = "DEMO model: trained on synthetic pictures. Not for diagnostic use."
 LIBRARY = Q(consent=True) | Q(source__in=["upload", "import", "synthetic"])
 
@@ -59,9 +62,13 @@ def model_with_metrics(m):
 def state(request):
     return Response({
         "readers": S.ReaderSerializer(M.Reader.objects.all(), many=True).data,
-        "active_model": model_with_metrics(inference.active_model()),
-        "thresholds": {"floor": CONF_FLOOR, "review": CONF_REVIEW, "positive": CONF_POSITIVE},
-        "pin_enabled": bool(pin()), "demo_banner": DEMO_BANNER,
+        "active_model": model_with_metrics(inference.active_model("zn")),
+        "active_models": {k: model_with_metrics(v) for k, v in inference.active_models().items()},
+        "thresholds": settings_store.thresholds("zn"),
+        "thresholds_by_modality": {m: settings_store.thresholds(m) for m in ("zn", "fm")},
+        "targets": settings_store.targets(), "prevalence": settings_store.prevalence(),
+        "modalities": grading.MODALITIES, "stains": grading.STAINS, "magnifications": grading.MAGNIFICATIONS,
+        "pin_enabled": bool(pin()), "lan_enabled": lan_enabled(), "version": VERSION, "demo_banner": DEMO_BANNER,
         "open_review": M.ReviewItem.objects.filter(status__in=["open", "disputed"]).count()})
 
 
@@ -100,33 +107,24 @@ def slide_detail(slide):
     slide.refresh_from_db()
     d = dict(S.SlideSerializer(slide).data)
     fields = slide_fields(slide)
-    pos = CONF_POSITIVE
+    pos = settings_store.thresholds(slide.modality)["positive"]
 
     def is_counted(x):
         return x["status"] in ("kept", "added") or (x["status"] == "pending" and x["conf"] >= pos)
     analysed = [f for f in fields if f["analysis"]]
     d["fields"] = fields
-    d["suggested"] = grading.grade_slide([sum(1 for x in f["detections"] if is_counted(x)) for f in analysed])
-    d["ai_only"] = grading.grade_slide([sum(1 for x in f["detections"] if x["conf"] >= pos) for f in analysed])
+    d["suggested"] = grading.grade_slide([sum(1 for x in f["detections"] if is_counted(x)) for f in analysed],
+                                         slide.modality, slide.magnification)
+    d["ai_only"] = grading.grade_slide([sum(1 for x in f["detections"] if x["conf"] >= pos) for f in analysed],
+                                       slide.modality, slide.magnification)
+    d["standard_fields"] = grading.standard_fields(slide.modality, slide.magnification)
+    d["capture_device"] = S.device_brief(slide.capture_device) if slide.capture_device_id else None
+    d["confirmation"] = confirm.status(slide, list(slide.confirmations.order_by("id")))
     end = slide.confirmed_at or timezone.now()
     d["elapsed_seconds"] = (end - slide.started_at).total_seconds()
     d["model"] = ({"id": slide.model.id, "name": slide.model.name, "demo": slide.model.demo} if slide.model else None)
+    d["model_missing"] = slide.model is None and inference.active_model(slide.modality) is None
     return d
-
-
-def create_analysis(slide, image, path, model):
-    res = inference.detect(path, model)
-    if res is None:
-        return None
-    dets, inf_ms, tot_ms = res
-    with transaction.atomic():
-        an = M.Analysis.objects.create(slide=slide, image=image, model=model, inference_ms=inf_ms, total_ms=tot_ms)
-        for d in dets:
-            det = M.Detection.objects.create(analysis=an, image=image, status="pending", **d)
-            if d["conf"] < CONF_REVIEW:
-                M.ReviewItem.objects.create(detection=det, image=image, cx=d["cx"], cy=d["cy"], w=d["w"], h=d["h"],
-                                            conf=d["conf"], status="open")
-    return an.id
 
 
 def get_or_404(model, pk, what="Item"):
@@ -158,9 +156,22 @@ class SlideViewSet(viewsets.GenericViewSet):
             fail("Slide ID is required (use an anonymous lab code, never a patient name).")
         if M.Slide.objects.filter(code=code).exists():
             fail(f"Slide {code} already exists.", 409)
-        sl = M.Slide.objects.create(code=code, site=v["site"].strip(), stain=v["stain"], magnification=v["magnification"],
-                                    status="open", started_by=reader_name(request))
-        audit(reader_name(request), "slide.start", code)
+        modality = v["microscopy"] or grading.modality_for_stain(v["stain"])
+        if modality not in grading.MODALITIES:
+            fail("Microscopy must be zn (bright-field) or fm (fluorescence).")
+        stain = v["stain"] if grading.modality_for_stain(v["stain"]) == modality else grading.STAINS[modality][0]
+        mag = v["magnification"] if v["magnification"] in grading.MAGNIFICATIONS[modality] else grading.MAGNIFICATIONS[modality][-1]
+        dev = None
+        if v["device_id"]:
+            dev = M.CaptureDevice.objects.filter(pk=v["device_id"], revoked=False).first()
+            if not dev:
+                fail("That phone is not paired (or was revoked).", 404)
+        sl = M.Slide.objects.create(code=code, site=v["site"].strip(), stain=stain, magnification=mag,
+                                    modality=modality, status="open", started_by=reader_name(request),
+                                    capture_device=dev)
+        if dev:                                    # one phone serves one open slide at a time
+            M.Slide.objects.filter(capture_device=dev, status="open").exclude(pk=sl.pk).update(capture_device=None)
+        audit(reader_name(request), "slide.start", f"{code} {modality} {mag}" + (f" phone={dev.name}" if dev else ""))
         return Response(slide_detail(sl))
 
     def retrieve(self, request, pk=None):
@@ -175,36 +186,11 @@ class SlideViewSet(viewsets.GenericViewSet):
         files = request.FILES.getlist("files")
         if not files:
             fail("No images were sent.")
-        model = inference.active_model()
-        results = []
-        for f in files:
-            try:
-                info = imaging.save_image(f.read())
-            except imaging.BadImage as e:
-                results.append({"file": f.name, "error": str(e)})
-                continue
-            if M.Image.objects.filter(slide=slide, sha256=info["sha256"]).exists():
-                results.append({"file": f.name, "error": "Already added to this slide."})
-                continue
-            fno = (M.Image.objects.filter(slide=slide).aggregate(m=Max("field_no"))["m"] or 0) + 1
-            im = M.Image.objects.create(
-                slide=slide, filename=f.name, path=info["path"], width=info["width"], height=info["height"],
-                sha256=info["sha256"], blur_score=info["blur_score"], quality_flag=info["quality_flag"],
-                status="unlabelled", source="analysis", added_by=reader, site=slide.site, field_no=fno)
-            r = {"file": f.name, "image_id": im.id, "quality_flag": info["quality_flag"]}
-            if model:
-                try:
-                    create_analysis(slide, im, info["path"], model)
-                except Exception as e:
-                    r["error"] = f"Model failed on this image: {e}"
-            results.append(r)
-        if model and not slide.model_id:
-            slide.model, slide.demo = model, model.demo
-            slide.save(update_fields=["model", "demo"])
+        results, model_missing = add_field_images(slide, [(f.name, f.read()) for f in files], reader)
         audit(reader, "slide.fields", f"{slide.code} +{sum(1 for r in results if 'image_id' in r)} fields")
         detail = slide_detail(slide)
         detail["upload_results"] = results
-        detail["model_missing"] = model is None
+        detail["model_missing"] = model_missing
         return Response(detail)
 
     @action(detail=True, methods=["post"], url_path="confirm")
@@ -241,9 +227,10 @@ class SlideViewSet(viewsets.GenericViewSet):
                     boxes = [M.Annotation(image_id=f["id"], label="afb", cx=d["cx"], cy=d["cy"], w=d["w"], h=d["h"],
                                           reader=reader)
                              for d in f["detections"]
-                             if d["status"] in ("kept", "added") or (d["status"] == "pending" and d["conf"] >= CONF_POSITIVE)]
+                             if d["status"] in ("kept", "added") or (d["status"] == "pending" and d["conf"] >= settings_store.thresholds(slide.modality)["positive"])]
                     M.Annotation.objects.bulk_create(boxes)
-                    M.Image.objects.filter(id=f["id"]).update(consent=True, status="labelled", last_labelled_by=reader)
+                    M.Image.objects.filter(id=f["id"]).update(consent=True, status="labelled", last_labelled_by=reader,
+                                                              modality=slide.modality)
                     added += 1
             audit(reader, "slide.confirm",
                   f"{slide.code} grade={v['final_grade']} ai={s['ai_only']['grade']} dataset+={added}")
@@ -294,6 +281,8 @@ class ImageViewSet(viewsets.GenericViewSet):
             qs = qs.filter(LIBRARY)
         if q.get("status"):
             qs = qs.filter(status=q["status"])
+        if q.get("modality") in ("zn", "fm"):
+            qs = qs.filter(modality=q["modality"])
         if q.get("slide_id"):
             qs = qs.filter(slide_id=q["slide_id"])
         if int(q.get("quality", 0)):
@@ -343,20 +332,23 @@ class ImageViewSet(viewsets.GenericViewSet):
     def upload(self, request):
         reader = reader_name(request)
         site, consent = request.data.get("site", ""), _bool(request.data.get("consent", 0))
+        modality = request.data.get("modality", "zn")
+        if modality not in grading.MODALITIES:
+            fail("Microscopy must be zn or fm.")
         added, skipped, errors = 0, 0, []
         for f in request.FILES.getlist("files"):
             try:
-                info = imaging.save_image(f.read())
+                info = imaging.save_image(f.read(), modality)
             except imaging.BadImage as e:
                 errors.append(f"{f.name}: {e}")
                 continue
-            if M.Image.objects.filter(sha256=info["sha256"], slide__isnull=True).exists():
+            if M.Image.objects.filter(sha256=info["sha256"], slide__isnull=True, modality=modality).exists():
                 skipped += 1
                 continue
             M.Image.objects.create(
                 filename=f.name, path=info["path"], width=info["width"], height=info["height"], sha256=info["sha256"],
                 blur_score=info["blur_score"], quality_flag=info["quality_flag"], status="unlabelled", source="upload",
-                added_by=reader, site=site, consent=consent)
+                added_by=reader, site=site, consent=consent, modality=modality)
             added += 1
         audit(reader, "images.upload", f"added={added} skipped={skipped} consent={int(consent)}")
         return Response({"added": added, "skipped": skipped, "errors": errors})
@@ -426,7 +418,8 @@ class ImageViewSet(viewsets.GenericViewSet):
 
 @api_view(["GET"])
 def dataset_stats(request):
-    lib = M.Image.objects.filter(LIBRARY)
+    modality = request.query_params.get("modality", "zn")
+    lib = M.Image.objects.filter(LIBRARY, modality=modality)
     flagged = lib.exclude(quality_flag__isnull=True).exclude(quality_flag="")
     return Response({
         "total": lib.count(),
@@ -435,9 +428,9 @@ def dataset_stats(request):
         "verified": lib.filter(status="verified").count(),
         "excluded": lib.filter(status="excluded").count(),
         "quality_flagged": flagged.count(),
-        "synthetic": M.Image.objects.filter(synthetic=True).count(),
-        "consent_pending": M.Image.objects.filter(consent=False, source__in=["upload", "import"]).count(),
-        "preview": datasets.preview(False, True)})
+        "synthetic": M.Image.objects.filter(synthetic=True, modality=modality).count(), "modality": modality,
+        "consent_pending": M.Image.objects.filter(consent=False, source__in=["upload", "import"], modality=modality).count(),
+        "preview": datasets.preview(False, True, modality)})
 
 
 @api_view(["POST"])
@@ -445,24 +438,27 @@ def make_synthetic(request):
     s = S.SyntheticIn(data=request.data)
     s.is_valid(raise_exception=True)
     n, seed = max(8, min(s.validated_data["count"], 400)), s.validated_data["seed"]
+    modality = s.validated_data["modality"]
     reader, made = reader_name(request), 0
+    maker = synth.make_field_fm if modality == "fm" else synth.make_field
     for k in range(0, n, 4):
-        code = f"SYN-{seed}-{k // 4 + 1:03d}"
+        code = f"SYN{modality.upper()}-{seed}-{k // 4 + 1:03d}"
         if M.Slide.objects.filter(code=code).exists():
             continue
         with transaction.atomic():
-            sl = M.Slide.objects.create(code=code, site="Synthetic", status="synthetic", demo=True,
+            sl = M.Slide.objects.create(code=code, site="Synthetic", status="synthetic", demo=True, modality=modality,
+                                        stain=grading.STAINS[modality][0], magnification=grading.MAGNIFICATIONS[modality][-1],
                                         notes="synthetic demo slide")
             for j in range(min(4, n - k)):
-                img, boxes = synth.make_field(seed * 100000 + k + j)
-                info = imaging.save_image(synth.encode_jpeg(img))
+                img, boxes = maker(seed * 100000 + k + j)
+                info = imaging.save_image(synth.encode_jpeg(img), modality)
                 if M.Image.objects.filter(slide=sl, sha256=info["sha256"]).exists():
                     continue
                 im = M.Image.objects.create(
                     slide=sl, filename=f"{code}-f{j + 1}.jpg", path=info["path"], width=info["width"],
                     height=info["height"], sha256=info["sha256"], blur_score=info["blur_score"], quality_flag=None,
                     status="verified", synthetic=True, source="synthetic", added_by=reader, site="Synthetic",
-                    field_no=j + 1, consent=True, last_labelled_by="synthetic-generator")
+                    field_no=j + 1, consent=True, last_labelled_by="synthetic-generator", modality=modality)
                 M.Annotation.objects.bulk_create([
                     M.Annotation(image=im, label="afb", cx=cx, cy=cy, w=w, h=h, reader="synthetic-generator")
                     for (cx, cy, w, h) in boxes])
@@ -476,9 +472,12 @@ def import_yolo(request):
     f = request.FILES.get("file")
     if not f:
         fail("Choose a .zip file first.")
+    modality = request.data.get("modality", "zn")
+    if modality not in grading.MODALITIES:
+        fail("Microscopy must be zn or fm.")
     try:
         res = datasets.import_yolo_zip(f.read(), reader_name(request), request.data.get("site", ""),
-                                       _bool(request.data.get("consent", 0)))
+                                       _bool(request.data.get("consent", 0)), modality)
     except zipfile.BadZipFile:
         fail("That file is not a zip archive.")
     audit(reader_name(request), "import.yolo", f"added={res['added']} skipped={res['skipped']}")

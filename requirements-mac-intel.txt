@@ -10,3 +10,4 @@ psutil
 torch==2.2.2
 torchvision==0.17.2
 contourpy<1.4
+segno>=1.6

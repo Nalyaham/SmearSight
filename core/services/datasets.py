@@ -13,11 +13,11 @@ from .config import DATASETS_DIR
 from .imaging import BadImage, save_image
 
 
-def eligible_images(include_single_read=False, include_synthetic=True):
+def eligible_images(include_single_read=False, include_synthetic=True, modality="zn"):
     """Images that may enter a training set: consent confirmed, not excluded, good enough
     quality, and labelled by two readers (verified) unless single-read labels are allowed."""
     statuses = ["verified", "labelled"] if include_single_read else ["verified"]
-    qs = Image.objects.filter(consent=True, status__in=statuses).filter(
+    qs = Image.objects.filter(consent=True, status__in=statuses, modality=modality).filter(
         Q(quality_flag__isnull=True) | Q(quality_flag="") | Q(synthetic=True))
     if not include_synthetic:
         qs = qs.filter(synthetic=False)
@@ -43,8 +43,8 @@ def _split_groups(groups, seed):
     return out
 
 
-def preview(include_single_read=False, include_synthetic=True):
-    imgs = list(eligible_images(include_single_read, include_synthetic).annotate(
+def preview(include_single_read=False, include_synthetic=True, modality="zn"):
+    imgs = list(eligible_images(include_single_read, include_synthetic, modality).annotate(
         n=Count("annotations", filter=Q(annotations__label="afb"))))
     pos = sum(1 for i in imgs if i.n)
     return {"images": len(imgs), "positive_images": pos, "negative_images": len(imgs) - pos,
@@ -52,10 +52,11 @@ def preview(include_single_read=False, include_synthetic=True):
 
 
 @transaction.atomic
-def freeze(name, seed, include_single_read, include_synthetic, reader):
-    imgs = list(eligible_images(include_single_read, include_synthetic).prefetch_related("annotations"))
+def freeze(name, seed, include_single_read, include_synthetic, reader, modality="zn"):
+    imgs = list(eligible_images(include_single_read, include_synthetic, modality).prefetch_related("annotations"))
     if len(imgs) < 12:
-        raise ValueError(f"Only {len(imgs)} eligible images. Label and verify at least 12 images first "
+        raise ValueError(f"Only {len(imgs)} eligible {'fluorescence' if modality == 'fm' else 'bright-field'} images. "
+                         "Label and verify at least 12 images first "
                          "(or generate demo images).")
     ann, groups = {}, {}
     for im in imgs:
@@ -66,8 +67,9 @@ def freeze(name, seed, include_single_read, include_synthetic, reader):
     split_of = _split_groups(groups, seed)
     counts = {"train": 0, "val": 0, "test": 0}
     ver = DatasetVersion.objects.create(
-        name=name, seed=seed, includes_synthetic=any(i.synthetic for i in imgs), created_by=reader,
-        config={"include_single_read": include_single_read, "include_synthetic": include_synthetic})
+        name=name, seed=seed, modality=modality, includes_synthetic=any(i.synthetic for i in imgs), created_by=reader,
+        config={"include_single_read": include_single_read, "include_synthetic": include_synthetic,
+                "modality": modality})
     root = DATASETS_DIR / f"v{ver.id}"
     for s in ("train", "val", "test"):
         (root / "images" / s).mkdir(parents=True, exist_ok=True)
@@ -88,7 +90,7 @@ def freeze(name, seed, include_single_read, include_synthetic, reader):
     return ver, len(groups)
 
 
-def import_yolo_zip(data: bytes, reader, site, consent):
+def import_yolo_zip(data: bytes, reader, site, consent, modality="zn"):
     """Zip with images/ and labels/ folders (YOLO txt, class 0 = AFB). Imported images are marked
     labelled (one source), so a second reader still verifies them before training."""
     zf = zipfile.ZipFile(io.BytesIO(data))
@@ -100,18 +102,18 @@ def import_yolo_zip(data: bytes, reader, site, consent):
             if not n.lower().endswith((".jpg", ".jpeg", ".png")):
                 continue
             try:
-                info = save_image(zf.read(n))
+                info = save_image(zf.read(n), modality)
             except BadImage:
                 skipped += 1
                 continue
-            if Image.objects.filter(sha256=info["sha256"], slide__isnull=True).exists():
+            if Image.objects.filter(sha256=info["sha256"], slide__isnull=True, modality=modality).exists():
                 skipped += 1
                 continue
             im = Image.objects.create(
                 filename=Path(n).name, path=info["path"], width=info["width"], height=info["height"],
                 sha256=info["sha256"], blur_score=info["blur_score"], quality_flag=info["quality_flag"],
                 status="labelled", source="import", added_by=reader, site=site, consent=bool(consent),
-                last_labelled_by="import")
+                last_labelled_by="import", modality=modality)
             lab = labels.get(Path(n).stem)
             if lab:
                 for line in zf.read(lab).decode("utf-8", "ignore").splitlines():

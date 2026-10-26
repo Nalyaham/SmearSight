@@ -22,6 +22,9 @@ ap.add_argument("--no-browser", action="store_true", help="do not open the brows
 a = ap.parse_args()
 if a.pin:
     os.environ["SMEARSIGHT_PIN"] = a.pin
+os.environ["SMEARSIGHT_PORT"] = str(a.port)
+if a.lan:
+    os.environ["SMEARSIGHT_LAN"] = "1"
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "smearsight_site.settings")
 
 try:

@@ -15,7 +15,8 @@ from django.core.management.base import BaseCommand
 from django.utils import timezone
 
 from core.models import MLModel, TrainingRun
-from core.services.config import CONF_POSITIVE, MODELS_DIR, RUNS_DIR
+from core.services import settings_store
+from core.services.config import MODELS_DIR, RUNS_DIR
 
 
 def update_run(run_id, **kw):
@@ -43,7 +44,26 @@ def pick_base(requested):
                                    "With real data, put yolov8n.pt in data/models/base/ for better results.")
 
 
-def evaluate(best, data_yaml, ds_root, imgsz):
+CUTOFF_GRID = [round(0.25 + 0.05 * i, 2) for i in range(14)]        # 0.25 ... 0.90
+
+
+def cutoff_table(rows, grid=CUTOFF_GRID):
+    """rows: [(truth_positive, max_confidence_in_image)] -> one line per image-level cut-off.
+    An image is called positive when its most confident detection is at or above the cut-off."""
+    table = []
+    for t in grid:
+        tp = sum(1 for tr, c in rows if tr and c >= t)
+        fn = sum(1 for tr, c in rows if tr and c < t)
+        fp = sum(1 for tr, c in rows if not tr and c >= t)
+        tn = sum(1 for tr, c in rows if not tr and c < t)
+        div = lambda a, b: (a / b) if b else None            # noqa: E731
+        table.append({"cutoff": t, "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+                      "sensitivity": div(tp, tp + fn), "specificity": div(tn, tn + fp),
+                      "ppv": div(tp, tp + fp), "npv": div(tn, tn + fn)})
+    return table
+
+
+def evaluate(best, data_yaml, ds_root, imgsz, modality="zn"):
     from ultralytics import YOLO
     model = YOLO(str(best))
     test_imgs = sorted((ds_root / "images" / "test").glob("*.jpg"))
@@ -58,29 +78,29 @@ def evaluate(best, data_yaml, ds_root, imgsz):
                    precision=float(m.box.mp), recall=float(m.box.mr))
     except Exception as e:   # tiny test sets can break the box-level metric; keep the rest
         out["map_error"] = str(e)[:200]
-    tp = fp = fn = tn = 0
-    times = []
+    rows, times = [], []
     for p in test_imgs:
         lab = ds_root / "labels" / "test" / f"{p.stem}.txt"
         truth = lab.exists() and lab.read_text().strip() != ""
-        r = model.predict(str(p), imgsz=imgsz, conf=CONF_POSITIVE, verbose=False, device="cpu")[0]
+        r = model.predict(str(p), imgsz=imgsz, conf=settings_store.FLOOR, verbose=False, device="cpu")[0]
         times.append(r.speed.get("preprocess", 0) + r.speed.get("inference", 0) + r.speed.get("postprocess", 0))
-        pred = r.boxes is not None and len(r.boxes) > 0
-        if truth and pred: tp += 1
-        elif truth and not pred: fn += 1
-        elif not truth and pred: fp += 1
-        else: tn += 1
-    out.update(tp=tp, fp=fp, fn=fn, tn=tn,
-               sensitivity=(tp / (tp + fn)) if (tp + fn) else None,
-               specificity=(tn / (tn + fp)) if (tn + fp) else None,
+        top = float(r.boxes.conf.max()) if (r.boxes is not None and len(r.boxes)) else 0.0
+        rows.append((bool(truth), top))
+    table = cutoff_table(rows)
+    thr = settings_store.thresholds(modality)["positive"]
+    at = min(table, key=lambda x: abs(x["cutoff"] - thr))
+    out.update(tp=at["tp"], fp=at["fp"], fn=at["fn"], tn=at["tn"], sensitivity=at["sensitivity"],
+               specificity=at["specificity"], ppv=at["ppv"], npv=at["npv"],
+               test_positive_share=sum(1 for t, _ in rows if t) / len(rows),
                median_inference_ms=statistics.median(times) if times else None,
-               image_threshold=CONF_POSITIVE)
+               image_threshold=at["cutoff"], cutoffs=table)
     return out
 
 
 def run_training(run_id):
     run = TrainingRun.objects.select_related("dataset_version").get(id=run_id)
     ds = run.dataset_version
+    modality = ds.modality or "zn"
     params = run.params or {}
     epochs = int(params.get("epochs", 30))
     imgsz = int(params.get("imgsz", 512))
@@ -127,13 +147,14 @@ def run_training(run_id):
         if not best.exists():
             best = project / "train" / "weights" / "last.pt"
         update_run(run_id, message="Evaluating on the held-out test slides...")
-        metrics = evaluate(best, data_yaml, ds_root, imgsz)
-        metrics.update(imgsz=imgsz, epochs=epochs, pretrained=pretrained, base=base,
+        metrics = evaluate(best, data_yaml, ds_root, imgsz, modality)
+        metrics.update(modality=modality, imgsz=imgsz, epochs=epochs, pretrained=pretrained, base=base,
                        train_images=ds.n_train, val_images=ds.n_val, dataset_version=ds.id)
         ver = MLModel.objects.count() + 1
-        dest = MODELS_DIR / f"model_v{ver}.pt"
+        tag = "fm" if modality == "fm" else "zn"
+        dest = MODELS_DIR / f"model_{tag}_v{ver}.pt"
         shutil.copy(best, dest)
-        m = MLModel.objects.create(name=f"v{ver}", path=str(dest), base="YOLOv8n", dataset_version=ds, run_id=run_id,
+        m = MLModel.objects.create(name=f"{tag}-v{ver}", modality=modality, path=str(dest), base="YOLOv8n", dataset_version=ds, run_id=run_id,
                                    metrics=metrics, status="candidate", demo=ds.includes_synthetic, notes=note)
         update_run(run_id, status="completed", finished_at=timezone.now(), model_id=m.id,
                    message="Done. Candidate model created.")

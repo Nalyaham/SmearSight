@@ -135,10 +135,11 @@ async function refreshState() {
   const b = $("#rv-badge");
   b.hidden = !S.state.open_review;
   b.textContent = S.state.open_review;
-  const m = S.state.active_model;
-  $("#model-chip").innerHTML = m
-    ? `Model <b style="color:#fff">${esc(m.name)}</b> ${m.demo ? '<span class="pill demo">DEMO</span>' : ""}`
-    : `<span style="color:#F7C98B">No active model</span>`;
+  $("#model-chip").innerHTML = ["zn", "fm"].map(k => {
+    const m = S.state.active_models[k];
+    return m ? `${MOD_SHORT[k]} <b style="color:#fff">${esc(m.name)}</b> ${m.demo ? '<span class="pill demo">DEMO</span>' : ""}`
+      : `${MOD_SHORT[k]} <span style="color:#F7C98B">no model</span>`;
+  }).join("<br>");
 }
 
 function boot() {
@@ -147,8 +148,11 @@ function boot() {
   render();
 }
 
-function demoBanner() {
-  const m = S.state.active_model;
+const MOD_SHORT = { zn: "Bright-field", fm: "Fluorescence" };
+const modPill = m => `<span class="pill ${m === "fm" ? "fm" : "teal"}">${m === "fm" ? "Fluorescence" : "Bright-field"}</span>`;
+function demoBanner(modality) {
+  const am = S.state.active_models;
+  const m = modality ? am[modality] : (am.zn && am.zn.demo ? am.zn : am.fm && am.fm.demo ? am.fm : am.zn || am.fm);
   return m && m.demo ? `<div class="banner"><b>Demo model active.</b> ${esc(S.state.demo_banner)} Results from this model are for testing the workflow only.</div>` : "";
 }
 

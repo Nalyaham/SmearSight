@@ -17,6 +17,9 @@ import os
 BLUR_THRESHOLD = float(os.environ.get("SMEARSIGHT_BLUR_MIN", 10.0))   # variance of Laplacian on a 640 px copy
 DARK_THRESHOLD = float(os.environ.get("SMEARSIGHT_DARK_MAX", 60.0))
 BRIGHT_THRESHOLD = float(os.environ.get("SMEARSIGHT_BRIGHT_MIN", 245.0))
+# Fluorescence fields are mostly black with a few bright rods, so the bright-field rules do not apply.
+BLUR_THRESHOLD_FM = float(os.environ.get("SMEARSIGHT_BLUR_MIN_FM", 2.0))
+HAZE_THRESHOLD_FM = float(os.environ.get("SMEARSIGHT_HAZE_MAX_FM", 110.0))   # mean grey above this = washed out
 
 
 class BadImage(Exception):
@@ -31,7 +34,7 @@ def decode(data: bytes):
     return img
 
 
-def quality(img):
+def quality(img, modality="zn"):
     h, w = img.shape[:2]
     scale = 640.0 / max(w, 1)
     small = cv2.resize(img, (640, max(1, int(h * scale)))) if w != 640 else img
@@ -39,6 +42,12 @@ def quality(img):
     blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     mean = float(gray.mean())
     flag = None
+    if modality == "fm":
+        if mean > HAZE_THRESHOLD_FM:
+            flag = "washed out"
+        elif blur < BLUR_THRESHOLD_FM:
+            flag = "blurry"
+        return blur, flag
     if blur < BLUR_THRESHOLD:
         flag = "blurry"
     elif mean < DARK_THRESHOLD:
@@ -48,7 +57,7 @@ def quality(img):
     return blur, flag
 
 
-def save_image(data: bytes):
+def save_image(data: bytes, modality="zn"):
     """Decode, downscale if huge, store as JPEG named by content hash.
     Returns dict(path, sha256, width, height, blur_score, quality_flag)."""
     img = decode(data)
@@ -63,7 +72,7 @@ def save_image(data: bytes):
     path = sub / f"{sha}.jpg"
     if not path.exists():
         cv2.imwrite(str(path), img, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    blur, flag = quality(img)
+    blur, flag = quality(img, modality)
     return {"path": str(path), "sha256": sha, "width": w, "height": h,
             "blur_score": blur, "quality_flag": flag}
 

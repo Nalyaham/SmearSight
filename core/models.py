@@ -30,6 +30,7 @@ class MLModel(models.Model):
     approved_by = models.CharField(max_length=120, blank=True, null=True)
     approved_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(blank=True, null=True)
+    modality = models.CharField(max_length=4, default="zn")           # zn = bright-field, fm = fluorescence
 
     class Meta:
         ordering = ["-id"]
@@ -60,6 +61,9 @@ class Slide(models.Model):
     reference_result = models.CharField(max_length=10, blank=True, null=True)   # pos | neg
     reference_method = models.CharField(max_length=80, blank=True, null=True)
     notes = models.TextField(blank=True, null=True)
+    modality = models.CharField(max_length=4, default="zn")           # zn = bright-field, fm = fluorescence
+    capture_device = models.ForeignKey("CaptureDevice", null=True, blank=True, on_delete=models.SET_NULL,
+                                       related_name="slides")        # the phone selected for this slide
 
     class Meta:
         ordering = ["-started_at"]
@@ -86,6 +90,8 @@ class Image(models.Model):
     site = models.CharField(max_length=200, blank=True, null=True)
     field_no = models.IntegerField(null=True, blank=True)
     consent = models.BooleanField(default=False)
+    device = models.ForeignKey("CaptureDevice", null=True, blank=True, on_delete=models.SET_NULL, related_name="images")
+    modality = models.CharField(max_length=4, default="zn")           # zn = bright-field, fm = fluorescence
 
     class Meta:
         ordering = ["id"]
@@ -157,6 +163,7 @@ class DatasetVersion(models.Model):
     includes_synthetic = models.BooleanField(default=False)
     config = models.JSONField(default=dict, blank=True)
     created_by = models.CharField(max_length=120, blank=True, null=True)
+    modality = models.CharField(max_length=4, default="zn")
 
     class Meta:
         ordering = ["-id"]
@@ -198,3 +205,85 @@ class AuditLog(models.Model):
 
     class Meta:
         ordering = ["-id"]
+
+
+# ------------------------------------------------------------------ phones used as cameras
+class CaptureDevice(models.Model):
+    """A phone or tablet paired with the app. It authenticates with a private token, never the PIN."""
+    name = models.CharField(max_length=80)
+    model_label = models.CharField(max_length=120, blank=True, default="")      # e.g. "Samsung SM-A135F"
+    platform = models.CharField(max_length=60, blank=True, default="")          # e.g. "Android 13"
+    browser = models.CharField(max_length=60, blank=True, default="")
+    token_hash = models.CharField(max_length=64, unique=True)
+    paired_by = models.CharField(max_length=120, blank=True, default="")
+    paired_at = models.DateTimeField(default=timezone.now)
+    last_seen = models.DateTimeField(null=True, blank=True)
+    last_ip = models.CharField(max_length=60, blank=True, default="")
+    revoked = models.BooleanField(default=False)
+    upload_count = models.IntegerField(default=0)
+    fail_count = models.IntegerField(default=0)
+    last_error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self):
+        return f"{self.name} ({self.model_label})"
+
+
+class PairingCode(models.Model):
+    """Six-digit, single-use, short-lived code shown on the computer to pair a phone."""
+    code = models.CharField(max_length=6, db_index=True)
+    created_by = models.CharField(max_length=120, blank=True, default="")
+    created_at = models.DateTimeField(default=timezone.now)
+    expires_at = models.DateTimeField()
+    used = models.BooleanField(default=False)
+    device = models.ForeignKey(CaptureDevice, null=True, blank=True, on_delete=models.SET_NULL)
+
+
+class CaptureEvent(models.Model):
+    """Audit trail of phone activity, used for monitoring after deployment."""
+    device = models.ForeignKey(CaptureDevice, null=True, blank=True, on_delete=models.SET_NULL, related_name="events")
+    kind = models.CharField(max_length=30)      # pair | pair_fail | upload_ok | upload_fail | select | revoke
+    detail = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["-id"]
+
+
+class Feedback(models.Model):
+    """Usability feedback from the phone page or the computer (used for user testing)."""
+    device = models.ForeignKey(CaptureDevice, null=True, blank=True, on_delete=models.SET_NULL)
+    reader = models.CharField(max_length=120, blank=True, default="")
+    source = models.CharField(max_length=10, default="desktop")                 # phone | desktop
+    rating = models.IntegerField()                                              # 1 to 5
+    comment = models.TextField(blank=True, default="")
+    context = models.CharField(max_length=120, blank=True, default="")
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["-id"]
+
+
+class AppSetting(models.Model):
+    """Editable cut-offs and targets (key -> JSON value)."""
+    key = models.CharField(max_length=60, unique=True)
+    value = models.JSONField(default=dict)
+
+
+class SlideConfirmation(models.Model):
+    """One step in confirming a positive slide (second reading, re-stain, molecular test, culture)."""
+    METHODS = ["blind_reread", "referee_reread", "zn_restain", "xpert", "culture", "other"]
+    slide = models.ForeignKey(Slide, on_delete=models.CASCADE, related_name="confirmations")
+    method = models.CharField(max_length=20)
+    result = models.CharField(max_length=40, blank=True, default="")            # detected | trace | not_detected | positive | ...
+    rif_result = models.CharField(max_length=20, blank=True, default="")        # xpert only: detected | not_detected | indeterminate
+    grade = models.CharField(max_length=20, blank=True, null=True)
+    by = models.CharField(max_length=120, blank=True, default="")
+    notes = models.TextField(blank=True, default="")
+    concordance = models.CharField(max_length=20, blank=True, null=True)        # concordant | minor | discordant
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["id"]

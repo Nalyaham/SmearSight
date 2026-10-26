@@ -96,6 +96,9 @@ class SlideIn(serializers.Serializer):
     site = serializers.CharField(max_length=200, allow_blank=True, default="")
     stain = serializers.CharField(max_length=40, default="Ziehl-Neelsen")
     magnification = serializers.CharField(max_length=20, default="1000x")
+    microscopy = serializers.ChoiceField(choices=["zn", "fm", ""], default="", required=False,
+                                         error_messages={"invalid_choice": "Microscopy must be zn or fm."})
+    device_id = serializers.IntegerField(required=False, allow_null=True, default=None)
 
 
 class ConfirmIn(serializers.Serializer):
@@ -132,6 +135,7 @@ class AnnotationsIn(serializers.Serializer):
 class SyntheticIn(serializers.Serializer):
     count = serializers.IntegerField(default=80)
     seed = serializers.IntegerField(default=1)
+    modality = serializers.ChoiceField(choices=["zn", "fm"], default="zn")
 
 
 class VoteIn(serializers.Serializer):
@@ -144,6 +148,7 @@ class FreezeIn(serializers.Serializer):
     seed = serializers.IntegerField(default=42)
     include_single_read = serializers.BooleanField(default=False)
     include_synthetic = serializers.BooleanField(default=True)
+    modality = serializers.ChoiceField(choices=["zn", "fm"], default="zn")
 
 
 class TrainIn(serializers.Serializer):
@@ -154,5 +159,71 @@ class TrainIn(serializers.Serializer):
     base = serializers.ChoiceField(choices=["auto", "scratch"], default="auto")
 
 
+class ConfirmationSerializer(LegacyModelSerializer):
+    class Meta:
+        model = models.SlideConfirmation
+        fields = "__all__"
+
+
 class PromoteIn(serializers.Serializer):
     approved_by = serializers.CharField()
+
+
+# ------------------------------------------------------------------ v2: phones, feedback, confirmation, settings
+def device_brief(d, online_seconds=90):
+    """What the computer shows about a phone. The private token hash is never sent anywhere."""
+    from django.utils import timezone as tz
+    if d is None:
+        return None
+    seen = d.last_seen.timestamp() if d.last_seen else None
+    return {"id": d.id, "name": d.name, "model_label": d.model_label, "platform": d.platform, "browser": d.browser,
+            "paired_by": d.paired_by, "paired_at": d.paired_at.timestamp(), "last_seen": seen,
+            "online": bool(d.last_seen and (tz.now() - d.last_seen).total_seconds() < online_seconds),
+            "revoked": d.revoked, "upload_count": d.upload_count, "fail_count": d.fail_count,
+            "last_error": d.last_error}
+
+
+class RenameIn(serializers.Serializer):
+    name = serializers.CharField(max_length=80, error_messages={"blank": "Give the phone a name.", "required": "Give the phone a name."})
+
+
+class SelectDeviceIn(serializers.Serializer):
+    device_id = serializers.IntegerField(allow_null=True)
+
+
+class PairIn(serializers.Serializer):
+    code = serializers.CharField(max_length=12, error_messages={"blank": "Enter the 6-digit code shown on the computer.",
+                                                                 "required": "Enter the 6-digit code shown on the computer."})
+    name = serializers.CharField(max_length=80, allow_blank=True, default="")
+
+
+class FeedbackIn(serializers.Serializer):
+    rating = serializers.IntegerField(min_value=1, max_value=5,
+                                      error_messages={"min_value": "Rating is 1 to 5.", "max_value": "Rating is 1 to 5.",
+                                                      "required": "Choose a rating from 1 to 5.", "invalid": "Rating is 1 to 5."})
+    comment = serializers.CharField(max_length=1000, allow_blank=True, default="")
+    context = serializers.CharField(max_length=120, allow_blank=True, default="")
+
+
+class ConfirmationIn(serializers.Serializer):
+    method = serializers.ChoiceField(choices=["blind_reread", "referee_reread", "zn_restain", "xpert", "culture", "other"],
+                                     error_messages={"invalid_choice": "Unknown confirmation step."})
+    result = serializers.CharField(max_length=40, allow_blank=True, default="")
+    grade = serializers.ChoiceField(choices=GRADES, required=False, allow_null=True, default=None,
+                                    error_messages={"invalid_choice": "Grade must be one of: " + ", ".join(GRADES) + "."})
+    rif_result = serializers.ChoiceField(choices=["detected", "not_detected", "indeterminate", ""], default="", required=False)
+    notes = serializers.CharField(max_length=1000, allow_blank=True, default="")
+
+
+class SettingsIn(serializers.Serializer):
+    modality = serializers.ChoiceField(choices=["zn", "fm"], default="zn")
+    positive = serializers.FloatField(required=False, min_value=0.05, max_value=0.95)
+    review = serializers.FloatField(required=False, min_value=0.05, max_value=1.0)
+    targets = serializers.DictField(child=serializers.FloatField(allow_null=True), required=False)
+    prevalence = serializers.FloatField(required=False)
+    approved_by = serializers.CharField(error_messages={"required": "Say who is making this change.", "blank": "Say who is making this change."})
+
+
+class CutoffIn(serializers.Serializer):
+    cutoff = serializers.FloatField(min_value=0.05, max_value=0.95)
+    approved_by = serializers.CharField(error_messages={"required": "Say who is making this change.", "blank": "Say who is making this change."})

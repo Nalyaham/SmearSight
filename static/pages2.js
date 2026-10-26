@@ -50,16 +50,17 @@ route("review", async (view, args) => {
 
 /* ---------------- Dataset ---------------- */
 route("dataset", async view => {
-  const D = { filter: "", offset: 0 };
+  const D = { filter: "", offset: 0, mod: (() => { try { return localStorage.getItem("ss_dmod") || "zn"; } catch (e) { return "zn"; } })() };
   const PAGE = 48;
   async function load() {
-    const q = new URLSearchParams({ limit: PAGE, offset: D.offset });
+    const q = new URLSearchParams({ limit: PAGE, offset: D.offset, modality: D.mod });
     if (D.filter === "quality") q.set("quality", 1); else if (D.filter === "pos") q.set("positive", "yes"); else if (D.filter === "neg") q.set("positive", "no"); else if (D.filter) q.set("status", D.filter);
-    const [st, imgs, vers] = await Promise.all([api("/api/dataset/stats"), api("/api/images?" + q), api("/api/datasets")]);
+    const [st, imgs, vers] = await Promise.all([api("/api/dataset/stats?modality=" + D.mod), api("/api/images?" + q), api("/api/datasets")]);
     const p = st.preview;
     const flt = [["", "All"], ["unlabelled", "Unlabelled"], ["labelled", "Labelled"], ["verified", "Verified"], ["excluded", "Excluded"], ["pos", "With AFB"], ["neg", "No AFB"], ["quality", "Quality flagged"]];
     view.innerHTML = `
-      <div class="topbar"><div><h1>Dataset</h1><div class="muted small">Images, labels and frozen versions used for training. Only consented, two-reader-verified images are used by default.</div></div></div>
+      <div class="topbar"><div><h1>Dataset</h1><div class="muted small">Images, labels and frozen versions used for training. Only consented, two-reader-verified images are used by default. Bright-field and fluorescence images are kept apart because each has its own model.</div></div><div class="sp"></div>
+        <div class="tabs" style="margin:0"><a data-m="zn" class="${D.mod === "zn" ? "on" : ""}">Bright-field</a><a data-m="fm" class="${D.mod === "fm" ? "on" : ""}">Fluorescence</a></div></div>
       <div class="grid g4" style="margin-bottom:14px">
         <div class="card stat"><div class="n">${st.total}</div><div class="l">Images</div><div class="d">${st.synthetic} synthetic demo</div></div>
         <div class="card stat"><div class="n">${st.verified}</div><div class="l">Verified (2 readers)</div><div class="d">${st.labelled} waiting for a second reader</div></div>
@@ -77,7 +78,7 @@ route("dataset", async view => {
           <p class="small muted">A .zip with <code>images/</code> and <code>labels/</code> folders in YOLO format (class 0 = AFB). A second reader still verifies them.</p>
           <input type="file" id="yz-file" accept=".zip"><label class="chk" style="margin-top:8px"><input type="checkbox" id="yz-consent"> Consent confirmed for this data</label>
           <button style="margin-top:8px" id="yz-go">Import zip</button></div>
-        <div class="card"><h2>Demo images</h2>
+        <div class="card"><h2>Demo images (${D.mod === "fm" ? "fluorescence" : "bright-field"})</h2>
           <p class="small muted">Generates synthetic smear-like pictures with known labels so you can try the full train and review workflow. Models trained on these are marked <span class="pill demo">DEMO</span> and must never be used clinically.</p>
           <div class="row"><input type="number" id="sy-n" value="120" min="8" max="400" style="width:90px"><button id="sy-go">Generate demo images</button></div></div>
       </div>
@@ -87,7 +88,7 @@ route("dataset", async view => {
           <label class="chk"><input type="checkbox" id="fz-syn" checked> Include synthetic demo images</label></div>
         <div id="fz-prev" class="small"></div>
         <div class="row" style="margin-top:8px"><input id="fz-name" placeholder="Version name (optional)" style="width:240px"><button class="primary" id="fz-go">Freeze version</button></div>
-        ${vers.length ? `<table style="margin-top:12px"><thead><tr><th>Version</th><th>Created</th><th>Train / val / test</th><th></th></tr></thead><tbody>${vers.map(v => `<tr><td><b>v${v.id}</b> ${esc(v.name)} ${demoPill(v.includes_synthetic)}</td><td class="muted">${fmtDate(v.created_at)}</td><td class="mono">${v.n_train} / ${v.n_val} / ${v.n_test}</td><td><a class="btn sm" href="#/training/${v.id}">Train on this</a></td></tr>`).join("")}</tbody></table>` : ""}</div>
+        ${vers.length ? `<table style="margin-top:12px"><thead><tr><th>Version</th><th>Created</th><th>Train / val / test</th><th></th></tr></thead><tbody>${vers.map(v => `<tr><td><b>v${v.id}</b> ${esc(v.name)} ${modPill(v.modality)} ${demoPill(v.includes_synthetic)}</td><td class="muted">${fmtDate(v.created_at)}</td><td class="mono">${v.n_train} / ${v.n_val} / ${v.n_test}</td><td><a class="btn sm" href="#/training/${v.id}">Train on this</a></td></tr>`).join("")}</tbody></table>` : ""}</div>
       <div class="card"><div class="row between"><h2 style="margin:0">Image library</h2><div class="tiny muted">${imgs.total} images</div></div>
         <div class="tabs" style="margin-top:8px">${flt.map(f => `<a data-f="${f[0]}" class="${D.filter === f[0] ? "on" : ""}">${f[1]}</a>`).join("")}</div>
         ${imgs.items.length ? `<div class="imggrid">${imgs.items.map(i => `<div class="imgcell" data-id="${i.id}"><img loading="lazy" src="/api/images/${i.id}/thumb?size=240"><div class="m"><span>${i.status === "verified" ? "verified" : i.status}${i.synthetic ? " (demo)" : ""}</span><span>${i.n_boxes} box${i.n_boxes == 1 ? "" : "es"}</span></div></div>`).join("")}</div>
@@ -95,23 +96,23 @@ route("dataset", async view => {
         : `<div class="empty small">No images match.</div>`}</div>`;
 
     const refreshPrev = async () => {
-      const pv = await api(`/api/datasets/preview?include_single_read=${$("#fz-single").checked ? 1 : 0}&include_synthetic=${$("#fz-syn").checked ? 1 : 0}`);
+      const pv = await api(`/api/datasets/preview?modality=${D.mod}&include_single_read=${$("#fz-single").checked ? 1 : 0}&include_synthetic=${$("#fz-syn").checked ? 1 : 0}`);
       $("#fz-prev").innerHTML = `<b>${pv.images}</b> eligible images (${pv.positive_images} with AFB, ${pv.negative_images} without) from <b>${pv.groups}</b> slides.` + (pv.images < 12 ? ' <span class="pill warn">need at least 12</span>' : "");
     };
     $("#fz-single").onchange = refreshPrev; $("#fz-syn").onchange = refreshPrev; refreshPrev();
     $("#fz-go").onclick = () => guard(async () => {
-      const r = await api("/api/datasets/freeze", { method: "POST", json: { name: $("#fz-name").value, include_single_read: $("#fz-single").checked, include_synthetic: $("#fz-syn").checked } });
+      const r = await api("/api/datasets/freeze", { method: "POST", json: { modality: D.mod, name: $("#fz-name").value, include_single_read: $("#fz-single").checked, include_synthetic: $("#fz-syn").checked } });
       toast(`Version v${r.id} frozen: ${r.n_train} train, ${r.n_val} val, ${r.n_test} test`); load();
     });
     $("#sy-go").onclick = () => guard(async () => {
       $("#sy-go").disabled = true; $("#sy-go").textContent = "Generating...";
-      const r = await api("/api/synthetic", { method: "POST", json: { count: +$("#sy-n").value, seed: Math.floor(Math.random() * 900) + 1 } });
+      const r = await api("/api/synthetic", { method: "POST", json: { modality: D.mod, count: +$("#sy-n").value, seed: Math.floor(Math.random() * 900) + 1 } });
       toast(r.made + " demo images created"); load();
     }).then(() => { const b = $("#sy-go"); if (b) { b.disabled = false; b.textContent = "Generate demo images"; } });
     const drop = $("#up-drop"), inp = $("#up-file");
     const up = files => guard(async () => {
       const fd = new FormData(); [...files].forEach(f => fd.append("files", f));
-      fd.append("site", $("#up-site").value); fd.append("consent", $("#up-consent").checked ? 1 : 0);
+      fd.append("site", $("#up-site").value); fd.append("consent", $("#up-consent").checked ? 1 : 0); fd.append("modality", D.mod);
       drop.textContent = "Uploading...";
       const r = await api("/api/images/upload", { method: "POST", form: fd });
       toast(`${r.added} added, ${r.skipped} duplicates${r.errors.length ? ", " + r.errors.length + " rejected" : ""}`, r.errors.length > 0 && r.added == 0); load();
@@ -122,9 +123,10 @@ route("dataset", async view => {
     drop.addEventListener("drop", e => up(e.dataTransfer.files));
     $("#yz-go").onclick = () => guard(async () => {
       const f = $("#yz-file").files[0]; if (!f) throw new Error("Choose a .zip file first.");
-      const fd = new FormData(); fd.append("file", f); fd.append("consent", $("#yz-consent").checked ? 1 : 0); fd.append("site", $("#up-site").value);
+      const fd = new FormData(); fd.append("file", f); fd.append("modality", D.mod); fd.append("consent", $("#yz-consent").checked ? 1 : 0); fd.append("site", $("#up-site").value);
       const r = await api("/api/import/yolo", { method: "POST", form: fd }); toast(`Imported ${r.added}, skipped ${r.skipped}`); load();
     });
+    $$("[data-m]").forEach(a => a.onclick = () => { D.mod = a.dataset.m; D.filter = ""; D.offset = 0; try { localStorage.setItem("ss_dmod", D.mod); } catch (e) {} load(); });
     $$("[data-f]").forEach(a => a.onclick = () => { D.filter = a.dataset.f; D.offset = 0; load(); });
     const pp = $("#pg-prev"), pn = $("#pg-next");
     if (pp) pp.onclick = () => { D.offset = Math.max(0, D.offset - PAGE); load(); };
@@ -198,7 +200,7 @@ route("training", async (view, args) => {
     const active = runs.find(r => r.status === "running" || r.status === "queued");
     const sel = args[0] ? +args[0] : (vers[0] && vers[0].id);
     const approvers = S.state.readers.filter(r => ["senior", "lead"].includes(r.role));
-    const act = models.find(m => m.status === "active");
+    
     const hist = active ? active.history : (runs[0] ? runs[0].history : []);
     view.innerHTML = `
       <div class="topbar"><div><h1>Model training</h1><div class="muted small">Trains a YOLOv8 nano detector on this computer. A new model is only a candidate until a senior reader approves it.</div></div></div>
@@ -206,7 +208,7 @@ route("training", async (view, args) => {
       <div class="grid g2" style="margin-bottom:14px;align-items:start">
         <div class="card"><h2>Start a run</h2>
           ${vers.length ? `<div class="grid" style="gap:10px">
-            <label class="f">Dataset version<select id="t-ds">${vers.map(v => `<option value="${v.id}" ${v.id === sel ? "selected" : ""}>v${v.id} ${esc(v.name)} (${v.n_train}/${v.n_val}/${v.n_test})${v.includes_synthetic ? " DEMO" : ""}</option>`).join("")}</select></label>
+            <label class="f">Dataset version<select id="t-ds">${vers.map(v => `<option value="${v.id}" ${v.id === sel ? "selected" : ""}>v${v.id} ${esc(v.name)} (${v.n_train}/${v.n_val}/${v.n_test}) ${v.modality === "fm" ? "FLUORESCENCE" : "bright-field"}${v.includes_synthetic ? " DEMO" : ""}</option>`).join("")}</select></label>
             <div class="row"><label class="f">Epochs<input id="t-ep" type="number" value="30" min="1" max="300" style="width:90px"></label>
               <label class="f">Image size<select id="t-sz"><option>512</option><option>640</option><option>416</option></select></label>
               <label class="f">Batch<input id="t-b" type="number" value="8" min="1" max="64" style="width:80px"></label>
@@ -223,13 +225,13 @@ route("training", async (view, args) => {
             { name: "validation box loss", color: "#B54708", points: hist.map(h => [h.epoch, h.val_box]) }], { yfmt: v => v.toFixed(2), h: 170 })}</div>` : ""}</div>
       </div>
       <div class="card"><h2>Models</h2>
-        ${models.length ? `<table><thead><tr><th>Model</th><th>Test images</th><th>Sensitivity</th><th>Specificity</th><th>mAP50</th><th>Time</th><th>Status</th><th></th></tr></thead><tbody>
-          ${models.map(m => `<tr><td><b>${esc(m.name)}</b> ${demoPill(m.demo)}<div class="tiny muted">dataset v${m.dataset_version_id} &middot; ${fmtDate(m.created_at)}</div></td>
-            <td class="mono">${m.metrics.test_images ?? "n/a"}</td><td class="mono">${pct(m.metrics.sensitivity)}</td><td class="mono">${pct(m.metrics.specificity)}</td>
+        ${models.length ? `<table><thead><tr><th>Model</th><th>Test images</th><th>Sens.</th><th>Spec.</th><th>PPV</th><th>NPV</th><th>mAP50</th><th>Time</th><th>Status</th><th></th></tr></thead><tbody>
+          ${models.map(m => `<tr><td><b>${esc(m.name)}</b> ${modPill(m.modality)} ${demoPill(m.demo)}<div class="tiny muted">dataset v${m.dataset_version_id} &middot; ${fmtDate(m.created_at)}</div></td>
+            <td class="mono">${m.metrics.test_images ?? "n/a"}</td><td class="mono">${pct(m.metrics.sensitivity)}</td><td class="mono">${pct(m.metrics.specificity)}</td><td class="mono">${pct(m.metrics.ppv)}</td><td class="mono">${pct(m.metrics.npv)}</td>
             <td class="mono">${m.metrics.map50 != null ? m.metrics.map50.toFixed(3) : "n/a"}</td><td class="mono">${m.metrics.median_inference_ms != null ? Math.round(m.metrics.median_inference_ms) + " ms" : "n/a"}</td>
             <td>${m.status === "active" ? '<span class="pill teal">active</span>' : `<span class="pill">${esc(m.status)}</span>`}</td>
-            <td>${m.status !== "active" ? `<button class="sm" data-p="${m.id}">${m.status === "archived" ? "Roll back to this" : "Approve and activate"}</button>` : ""}</td></tr>`).join("")}</tbody></table>
-          <div class="tiny muted" style="margin-top:8px">Image-level figures are measured on test slides the model never saw, at confidence ${S.state.thresholds.positive}. With few test images they carry wide uncertainty. Approval is blocked if sensitivity is lower than the active model's.</div>
+            <td style="white-space:nowrap"><button class="sm" data-co="${m.id}">Cut-offs</button> ${m.status !== "active" ? `<button class="sm" data-p="${m.id}">${m.status === "archived" ? "Roll back to this" : "Approve and activate"}</button>` : ""}</td></tr>`).join("")}</tbody></table>
+          <div class="tiny muted" style="margin-top:8px">Image-level figures are measured on test slides the model never saw, at the count cut-off in use (bright-field ${S.state.thresholds_by_modality.zn.positive}, fluorescence ${S.state.thresholds_by_modality.fm.positive}). With few test images they carry wide uncertainty; PPV and NPV also depend on how many test images contain AFB. Open <i>Cut-offs</i> to see every threshold. Approval is blocked if sensitivity is lower than the active model of the same microscopy type.</div>
           <div class="row" style="margin-top:10px"><label class="f">Approver<select id="p-by">${approvers.map(a => `<option ${a.name === reader() ? "selected" : ""}>${esc(a.name)}</option>`).join("")}</select></label></div>`
         : `<div class="empty small">No models yet.</div>`}</div>
       ${runs.length > 1 ? `<div class="card" style="margin-top:14px"><h3>Run history</h3><table><tbody>${runs.map(r => `<tr><td>Run ${r.id}</td><td>${statusPill(r.status)}</td><td class="muted small">dataset v${r.dataset_version_id}, ${r.params.epochs} epochs</td><td class="muted small">${fmtDate(r.started_at)} by ${esc(r.started_by || "")}</td></tr>`).join("")}</tbody></table></div>` : ""}`;
@@ -239,6 +241,7 @@ route("training", async (view, args) => {
       toast("Training started"); load();
     });
     const ca = $("#t-cancel"); if (ca) ca.onclick = () => guard(async () => { await api(`/api/training/${active.id}/cancel`, { method: "POST" }); load(); });
+    $$("[data-co]").forEach(b => b.onclick = () => guard(() => showCutoffs(+b.dataset.co)));
     $$("[data-p]").forEach(b => b.onclick = () => guard(async () => {
       await api(`/api/models/${b.dataset.p}/promote`, { method: "POST", json: { approved_by: $("#p-by").value } });
       toast("Model is now active"); await refreshState(); load();
@@ -252,17 +255,23 @@ const statusPill = s => `<span class="pill ${s === "completed" ? "neg" : s === "
 
 /* ---------------- Performance ---------------- */
 route("performance", async view => {
-  const P = { days: 0, demo: 0 };
+  const P = { days: 0, demo: 0, mod: "" };
   async function load() {
-    const d = await api(`/api/performance?days=${P.days}&include_demo=${P.demo}`);
+    const d = await api(`/api/performance?days=${P.days}&include_demo=${P.demo}&modality=${P.mod}`);
+    const tp = (c, k) => { const t = c.targets && c.targets[k]; if (!t || t.status === "no_data") return ""; const cls = { met: "met", point: "point", not_met: "notmet" }[t.status], txt = { met: "meets target", point: "at target, interval too wide", not_met: "below target" }[t.status]; return `<span class="pill ${cls}" title="Target ${Math.round(t.target * 100)}%">${txt}</span>`; };
     const cm = (name, c) => `<div class="card"><h2>${name}</h2>
       ${c.n_with_reference ? `<table><tbody><tr><td>Slides with a reference result</td><td class="mono">${c.n_with_reference}</td></tr>
-        <tr><td>Sensitivity</td><td class="mono"><b>${pct(c.sensitivity)}</b> ${ci(c.sens_ci)}</td></tr>
-        <tr><td>Specificity</td><td class="mono"><b>${pct(c.specificity)}</b> ${ci(c.spec_ci)}</td></tr>
-        <tr><td>True pos / false pos</td><td class="mono">${c.tp} / ${c.fp}</td></tr><tr><td>False neg / true neg</td><td class="mono">${c.fn} / ${c.tn}</td></tr></tbody></table>`
-        : `<div class="empty small">Add reference results (culture or Xpert) on confirmed slides to see this.</div>`}</div>`;
+        <tr><td>Sensitivity</td><td class="mono"><b>${pct(c.sensitivity)}</b> ${ci(c.sens_ci)} ${tp(c, "sensitivity")}</td></tr>
+        <tr><td>Specificity</td><td class="mono"><b>${pct(c.specificity)}</b> ${ci(c.spec_ci)} ${tp(c, "specificity")}</td></tr>
+        <tr><td>Positive predictive value</td><td class="mono"><b>${pct(c.ppv)}</b> ${ci(c.ppv_ci)} ${tp(c, "ppv")}</td></tr>
+        <tr><td>Negative predictive value</td><td class="mono"><b>${pct(c.npv)}</b> ${ci(c.npv_ci)} ${tp(c, "npv")}</td></tr>
+        <tr><td>True pos / false pos</td><td class="mono">${c.tp} / ${c.fp}</td></tr><tr><td>False neg / true neg</td><td class="mono">${c.fn} / ${c.tn}</td></tr></tbody></table>
+        ${c.adjusted && c.adjusted.ppv != null ? `<div class="tiny muted" style="margin-top:8px">At ${(c.adjusted.prevalence * 100).toFixed(1)}% positives among people tested (Settings), these would give PPV <b>${pct(c.adjusted.ppv, 0)}</b> (${pct(c.adjusted.ppv_range[0], 0)} to ${pct(c.adjusted.ppv_range[1], 0)}) and NPV <b>${pct(c.adjusted.npv, 1)}</b> (${pct(c.adjusted.npv_range[0], 1)} to ${pct(c.adjusted.npv_range[1], 1)}).</div>` : ""}
+        <div class="tiny muted" style="margin-top:4px">"Meets target" needs the lower end of the 95% interval at or above the target. PPV and NPV depend on how common positives are in this sample.</div>`
+        : `<div class="empty small">Add reference results (culture or Xpert) on confirmed slides to see this. Positive <i>and</i> negative slides need one, or NPV cannot be measured.</div>`}</div>`;
     view.innerHTML = `
       <div class="topbar"><div><h1>Performance</h1><div class="muted small">Time per slide and accuracy against reference results, with 95% confidence intervals.</div></div><div class="sp"></div>
+        <select id="p-mod"><option value="">All microscopy</option><option value="zn">Bright-field</option><option value="fm">Fluorescence</option></select>
         <select id="p-days"><option value="0">All time</option><option value="7">Last 7 days</option><option value="30">Last 30 days</option></select>
         <label class="chk"><input type="checkbox" id="p-demo" ${P.demo ? "checked" : ""}> Include demo data</label>
         <a class="btn" href="/api/export/slides.csv?include_demo=${P.demo}">Export CSV</a></div>
@@ -286,7 +295,8 @@ route("performance", async view => {
           <tr><td>90th percentile</td><td class="mono">${d.inference_p90_ms != null ? Math.round(d.inference_p90_ms) + " ms" : "n/a"}</td></tr></tbody></table></div>
         <div class="card"><h2>By site</h2>${d.by_site.length ? `<table><thead><tr><th>Site</th><th>Slides</th><th>Median time</th><th>Changed</th><th>Sensitivity</th></tr></thead><tbody>${d.by_site.map(s => `<tr><td>${esc(s.site)}</td><td class="mono">${s.slides}</td><td class="mono">${fmtDur(s.median_seconds)}</td><td class="mono">${s.overrides}/${s.with_ai}</td><td class="mono">${s.sensitivity != null ? pct(s.sensitivity, 0) + ` (n=${s.positives_with_reference})` : "n/a"}</td></tr>`).join("")}</tbody></table>` : `<div class="empty small">No data.</div>`}</div>
       </div>`;
-    $("#p-days").value = P.days;
+    $("#p-days").value = P.days; $("#p-mod").value = P.mod;
+    $("#p-mod").onchange = e => { P.mod = e.target.value; load(); };
     $("#p-days").onchange = e => { P.days = +e.target.value; load(); };
     $("#p-demo").onchange = e => { P.demo = e.target.checked ? 1 : 0; load(); };
   }
@@ -298,7 +308,8 @@ route("settings", async view => {
   const [audit] = await Promise.all([api("/api/audit?limit=100")]);
   const s = S.state;
   view.innerHTML = `
-    <div class="topbar"><div><h1>Settings and audit</h1></div></div>
+    <div class="topbar"><div><h1>Settings, phones and audit</h1></div></div>
+    <div id="v2-extras"></div>
     <div class="grid g2" style="margin-bottom:14px;align-items:start">
       <div class="card"><h2>Readers</h2>
         <table><tbody>${s.readers.map(r => `<tr><td>${esc(r.name)}</td><td><span class="pill">${esc(r.role)}</span></td></tr>`).join("")}</tbody></table>
@@ -306,7 +317,7 @@ route("settings", async view => {
         <div class="tiny muted" style="margin-top:6px">Senior readers and the lab lead resolve disputed review items and approve models. Pick who you are in the left menu.</div></div>
       <div class="card"><h2>Data and safety</h2>
         <table><tbody><tr><td>Access PIN</td><td>${s.pin_enabled ? "On" : '<span class="pill warn">Off</span> (start with <code>python run.py --lan --pin 1234</code> before sharing on Wi-Fi)'}</td></tr>
-        <tr><td>Count a bacillus at confidence</td><td class="mono">${s.thresholds.positive}</td></tr><tr><td>Send to expert review below</td><td class="mono">${s.thresholds.review}</td></tr><tr><td>Hide detections below</td><td class="mono">${s.thresholds.floor}</td></tr></tbody></table>
+        <tr><td>Hide detections below</td><td class="mono">${s.thresholds.floor}</td></tr></tbody></table>
         <div style="margin-top:10px"><a class="btn" href="/api/backup.zip">Download full backup</a></div>
         <div class="tiny muted" style="margin-top:6px">Backup contains images, models and the database. Store it somewhere safe and follow your ethics approval for data handling.</div></div>
     </div>
@@ -314,5 +325,6 @@ route("settings", async view => {
       <p class="small">SmearSight assists a trained reader; it does not replace one, and it is not a validated diagnostic device. Before any use on real patient slides it needs a prospective evaluation against culture or Xpert at your own laboratory, ethics approval, and sign-off by the laboratory lead. Models trained on demo images say nothing about real smears.</p></div>
     <div class="card" style="margin-top:14px"><h2>Audit log</h2><div style="max-height:380px;overflow:auto"><table><thead><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr></thead><tbody>
       ${audit.map(a => `<tr><td class="small muted" style="white-space:nowrap">${fmtDate(a.ts)}</td><td>${esc(a.reader)}</td><td><code>${esc(a.action)}</code></td><td class="small muted">${esc(a.detail)}</td></tr>`).join("")}</tbody></table></div></div>`;
+  guard(() => settingsExtras($("#v2-extras")));
   $("#rd-add").onclick = () => guard(async () => { await api("/api/readers", { method: "POST", json: { name: $("#rd-name").value, role: $("#rd-role").value } }); toast("Saved"); await refreshState(); render(); });
 });

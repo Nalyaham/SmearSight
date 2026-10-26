@@ -6,34 +6,38 @@ from ..models import MLModel
 from .config import CONF_FLOOR
 
 _lock = threading.Lock()
-_cache = {"model_id": None, "model": None, "imgsz": 512}
+_cache = {}        # model id -> (YOLO model, imgsz); one entry per active model (bright-field and fluorescence)
 
 
-def active_model():
-    return MLModel.objects.filter(status="active").order_by("-approved_at", "-id").first()
+def active_model(modality="zn"):
+    return MLModel.objects.filter(status="active", modality=modality).order_by("-approved_at", "-id").first()
+
+
+def active_models():
+    return {mod: active_model(mod) for mod in ("zn", "fm")}
 
 
 def _load(m):
     from ultralytics import YOLO   # imported lazily: starting the web app does not need torch
     with _lock:
-        if _cache["model_id"] != m.id:
+        if m.id not in _cache:
             model = YOLO(m.path)
             imgsz = int((m.metrics or {}).get("imgsz", 512))
-            _cache.update(model_id=m.id, model=model, imgsz=imgsz)
+            _cache[m.id] = (model, imgsz)
             # warm-up so the first real slide is not slower than the rest
             import numpy as np
             model.predict(np.zeros((imgsz, imgsz, 3), np.uint8), imgsz=imgsz, conf=0.9, verbose=False, device="cpu")
-        return _cache["model"], _cache["imgsz"]
+        return _cache[m.id]
 
 
 def forget():
     with _lock:
-        _cache.update(model_id=None, model=None)
+        _cache.clear()
 
 
-def detect(image_path, m=None):
+def detect(image_path, m=None, modality="zn"):
     """Returns (detections, inference_ms, total_ms). Boxes are normalised YOLO centre format."""
-    m = m or active_model()
+    m = m or active_model(modality)
     if not m:
         return None
     model, imgsz = _load(m)

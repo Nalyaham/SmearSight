@@ -78,3 +78,50 @@ def make_field(seed: int, size: int = 512, n_rods=None, tint=None):
 def encode_jpeg(img):
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])
     return buf.tobytes()
+
+
+def make_field_fm(seed: int, size: int = 512, n_rods=None):
+    """Fluorescence (auramine) look: near-black background, bright yellow-green rods with a glow,
+    dim round or fibre-like debris as hard negatives. Returns (image BGR uint8, boxes)."""
+    r = random.Random(seed)
+    rng = np.random.default_rng(seed)
+    img = np.ones((size, size, 3), np.float32) * np.array([14, 10, 9], np.float32)
+    yy, xx = np.mgrid[0:size, 0:size]
+    img *= (1 + 0.5 * np.exp(-(((xx - size / 2) ** 2 + (yy - size / 2) ** 2) / (2 * (size * 0.45) ** 2))))[..., None]
+    layer = np.zeros_like(img)
+    # dim autofluorescent debris (not bacilli): blue-green blobs and short fibres
+    for _ in range(r.randint(3, 10)):
+        c = (int(r.uniform(8, size - 8)), int(r.uniform(8, size - 8)))
+        col = (r.randint(60, 110), r.randint(55, 95), r.randint(15, 40))
+        if r.random() < 0.6:
+            cv2.circle(layer, c, r.randint(2, 6), col, -1, cv2.LINE_AA)
+        else:
+            a = r.uniform(0, math.pi)
+            ln = r.randint(14, 40)
+            cv2.line(layer, c, (int(c[0] + math.cos(a) * ln), int(c[1] + math.sin(a) * ln)), col, 1, cv2.LINE_AA)
+    boxes, placed = [], []
+    count = n_rods if n_rods is not None else (0 if r.random() < 0.4 else r.randint(1, 9))
+    for _ in range(count):
+        for _try in range(30):
+            c = (r.uniform(24, size - 24), r.uniform(24, size - 24))
+            if all(math.hypot(c[0] - p[0], c[1] - p[1]) > 34 for p in placed):
+                break
+        placed.append(c)
+        length, thick = r.uniform(16, 30), r.uniform(2.6, 4.0)
+        ang, bend = r.uniform(0, math.pi), r.uniform(-0.18, 0.18)
+        pts = []
+        for t in np.linspace(-0.5, 0.5, 9):
+            pts.append((c[0] + math.cos(ang) * t * length + math.sin(ang) * bend * length * (t * t) * 2,
+                        c[1] + math.sin(ang) * t * length - math.cos(ang) * bend * length * (t * t) * 2))
+        pts = np.array(pts, np.int32).reshape(-1, 1, 2)
+        col = (r.randint(40, 90), r.randint(215, 250), r.randint(170, 215))      # auramine yellow-green (BGR)
+        cv2.polylines(layer, [pts], False, col, int(round(thick)), cv2.LINE_AA)
+        xs, ys = pts[:, 0, 0], pts[:, 0, 1]
+        pad = 5
+        x1, x2 = max(0, xs.min() - pad), min(size, xs.max() + pad)
+        y1, y2 = max(0, ys.min() - pad), min(size, ys.max() + pad)
+        boxes.append(((x1 + x2) / 2 / size, (y1 + y2) / 2 / size, (x2 - x1) / size, (y2 - y1) / size))
+    glow = cv2.GaussianBlur(layer, (0, 0), 5) * 0.8
+    img += cv2.GaussianBlur(layer, (0, 0), 0.8) + glow
+    img += _noise(rng, img.shape, 3.0)
+    return np.clip(img, 0, 255).astype(np.uint8), boxes

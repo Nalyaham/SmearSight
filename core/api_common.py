@@ -6,7 +6,7 @@ from rest_framework.exceptions import APIException
 from rest_framework.views import exception_handler as drf_exception_handler
 
 from .models import AuditLog, Reader
-from .services.config import CONF_POSITIVE
+from .services import settings_store
 
 
 class ApiError(APIException):
@@ -34,9 +34,11 @@ def audit(reader, action, detail=""):
     AuditLog.objects.create(reader=reader or "unknown", action=action, detail=str(detail))
 
 
-def counted(det):
+def counted(det, positive=None, modality="zn"):
     """Does this detection count as a bacillus in the grade?"""
-    return det.status in ("kept", "added") or (det.status == "pending" and det.conf >= CONF_POSITIVE)
+    if positive is None:
+        positive = settings_store.thresholds(modality)["positive"]
+    return det.status in ("kept", "added") or (det.status == "pending" and det.conf >= positive)
 
 
 class LegacyModelSerializer(serializers.ModelSerializer):

@@ -20,7 +20,7 @@ from rest_framework.response import Response
 from . import models as M
 from . import serializers as S
 from .api_common import audit, fail, reader_name, reader_role
-from .services import datasets, grading, inference
+from .services import confirm, datasets, grading, inference, settings_store
 from .services.config import BASE_DIR, DATA_DIR, DB_PATH
 from .services.stats import percentile, wilson
 from .views import get_or_404
@@ -37,7 +37,8 @@ class DatasetViewSet(viewsets.GenericViewSet):
     @action(detail=False, methods=["get"], url_path="preview")
     def preview(self, request):
         q = request.query_params
-        return Response(datasets.preview(q.get("include_single_read", "0") == "1", q.get("include_synthetic", "1") == "1"))
+        return Response(datasets.preview(q.get("include_single_read", "0") == "1", q.get("include_synthetic", "1") == "1",
+                                         q.get("modality", "zn")))
 
     @action(detail=False, methods=["post"], url_path="freeze")
     def freeze(self, request):
@@ -46,10 +47,11 @@ class DatasetViewSet(viewsets.GenericViewSet):
         v = f.validated_data
         try:
             ver, n_slides = datasets.freeze(v["name"].strip() or f"Dataset {datetime.now():%Y-%m-%d %H:%M}", v["seed"],
-                                            v["include_single_read"], v["include_synthetic"], reader_name(request))
+                                            v["include_single_read"], v["include_synthetic"], reader_name(request),
+                                            v["modality"])
         except ValueError as e:
             fail(str(e))
-        audit(reader_name(request), "dataset.freeze", f"v{ver.id} train={ver.n_train} val={ver.n_val} test={ver.n_test}")
+        audit(reader_name(request), "dataset.freeze", f"v{ver.id} {ver.modality} train={ver.n_train} val={ver.n_val} test={ver.n_test}")
         return Response({"id": ver.id, "name": ver.name, "n_train": ver.n_train, "n_val": ver.n_val,
                          "n_test": ver.n_test, "slides": n_slides})
 
@@ -162,11 +164,11 @@ class ModelViewSet(viewsets.GenericViewSet):
         if reader_role(by) not in ("senior", "lead"):
             fail("Only a senior reader or the laboratory lead can approve a model.", 403)
         metrics = m.metrics or {}
-        cur = M.MLModel.objects.filter(status="active").first()
+        cur = M.MLModel.objects.filter(status="active", modality=m.modality).first()
         if m.status == "candidate":
             if not metrics.get("test_images"):
                 fail("No held-out test result for this model, so it cannot be approved.", 409)
-            if cur:
+            if cur:                          # only compared against the active model of the SAME microscopy type
                 cm = cur.metrics or {}
                 if (cm.get("sensitivity") is not None and metrics.get("sensitivity") is not None
                         and metrics["sensitivity"] < cm["sensitivity"]):
@@ -175,14 +177,51 @@ class ModelViewSet(viewsets.GenericViewSet):
         if cur:
             M.MLModel.objects.filter(id=cur.id).update(status="archived")
         M.MLModel.objects.filter(id=m.id).update(status="active", approved_by=by, approved_at=timezone.now())
-        audit(reader_name(request), "model.promote", f"{m.name} approved by {by}")
+        audit(reader_name(request), "model.promote", f"{m.name} ({m.modality}) approved by {by}")
         inference.forget()
         return Response({"ok": True})
 
+    @action(detail=True, methods=["get"], url_path="cutoffs")
+    def cutoffs(self, request, pk=None):
+        """Image-level cut-off table of a model with 95% intervals, PPV/NPV and the targets."""
+        m = get_or_404(M.MLModel, pk, "Model")
+        mt = m.metrics or {}
+        tg = settings_store.targets()
+        rows = []
+        for r in mt.get("cutoffs") or []:
+            pos, neg = r["tp"] + r["fn"], r["tn"] + r["fp"]
+            rows.append({**r, "sens_ci": wilson(r["tp"], pos), "spec_ci": wilson(r["tn"], neg),
+                         "ppv_ci": wilson(r["tp"], r["tp"] + r["fp"]), "npv_ci": wilson(r["tn"], r["tn"] + r["fn"]),
+                         "meets_targets": all(r[k] is not None and r[k] >= tg[k]
+                                              for k in ("sensitivity", "specificity", "ppv", "npv"))})
+        cur = settings_store.thresholds(m.modality)["positive"]
+        return Response({"model": m.name, "modality": m.modality, "current_cutoff": cur, "targets": tg,
+                         "test_images": mt.get("test_images"), "test_positive_share": mt.get("test_positive_share"),
+                         "rows": rows,
+                         "note": "Image-level result on the held-out test slides. PPV and NPV depend on how common "
+                                 "positives are in the test set, so they are not the values to expect in routine work."})
+
+    @action(detail=True, methods=["post"], url_path="cutoff")
+    def apply_cutoff(self, request, pk=None):
+        c = S.CutoffIn(data=request.data)
+        c.is_valid(raise_exception=True)
+        m = get_or_404(M.MLModel, pk, "Model")
+        by = c.validated_data["approved_by"]
+        if reader_role(by) not in ("senior", "lead"):
+            fail("Only a senior reader or the laboratory lead can change the count cut-off.", 403)
+        try:
+            th = settings_store.set_thresholds(m.modality, c.validated_data["cutoff"])
+        except ValueError as e:
+            fail(str(e))
+        audit(reader_name(request), "settings.cutoff", f"{m.modality} positive={th['positive']} review={th['review']} by {by} (model {m.name})")
+        return Response(th)
+
 
 # ================================================================== dashboard + performance
-def confirmed_slides(include_demo, days):
+def confirmed_slides(include_demo, days, modality=None):
     qs = M.Slide.objects.filter(status="confirmed")
+    if modality in ("zn", "fm"):
+        qs = qs.filter(modality=modality)
     if not include_demo:
         qs = qs.filter(demo=False)
     if days:
@@ -190,10 +229,47 @@ def confirmed_slides(include_demo, days):
     return list(qs)
 
 
+def target_check(c):
+    """Compare each measure with its target. 'met' needs the lower 95% limit at or above the target;
+    'point' means the estimate is at target but the interval is still too wide to be sure."""
+    out = {}
+    for k, ci in (("sensitivity", "sens_ci"), ("specificity", "spec_ci"), ("ppv", "ppv_ci"), ("npv", "npv_ci")):
+        tgt, v = settings_store.targets()[k], c.get(k)
+        if v is None:
+            out[k] = {"target": tgt, "status": "no_data"}
+        elif c[ci] and c[ci][0] >= tgt:
+            out[k] = {"target": tgt, "status": "met"}
+        elif v >= tgt:
+            out[k] = {"target": tgt, "status": "point"}
+        else:
+            out[k] = {"target": tgt, "status": "not_met"}
+    return out
+
+
+def predictive_values(sens, spec, prev):
+    ppv_den = sens * prev + (1 - spec) * (1 - prev)
+    npv_den = spec * (1 - prev) + (1 - sens) * prev
+    return (sens * prev / ppv_den if ppv_den else None), (spec * (1 - prev) / npv_den if npv_den else None)
+
+
+def adjusted_predictive_values(c, prevalence=None):
+    """PPV and NPV re-computed for the prevalence of smear-positive TB where the tool will be used.
+    PPV and NPV both rise with sensitivity and with specificity, so the range uses the lower and upper
+    95% limits of each."""
+    prev = prevalence or settings_store.prevalence()
+    if c["sensitivity"] is None or c["specificity"] is None:
+        return {"prevalence": prev, "ppv": None, "npv": None}
+    ppv, npv = predictive_values(c["sensitivity"], c["specificity"], prev)
+    lo = predictive_values(c["sens_ci"][0], c["spec_ci"][0], prev)
+    hi = predictive_values(c["sens_ci"][1], c["spec_ci"][1], prev)
+    return {"prevalence": prev, "ppv": ppv, "npv": npv, "ppv_range": [lo[0], hi[0]], "npv_range": [lo[1], hi[1]]}
+
+
 @api_view(["GET"])
 def performance(request):
     days, include_demo = int(request.query_params.get("days", 0)), int(request.query_params.get("include_demo", 0))
-    sl = confirmed_slides(include_demo, days)
+    modality = request.query_params.get("modality") or None
+    sl = confirmed_slides(include_demo, days, modality)
     sess = [s.session_seconds for s in sl if s.session_seconds is not None]
     manual = [s.manual_seconds for s in sl if s.manual_seconds]
     bins = [(0, 30, "under 0:30"), (30, 60, "0:30 to 1:00"), (60, 90, "1:00 to 1:30"), (90, 120, "1:30 to 2:00"),
@@ -211,7 +287,13 @@ def performance(request):
         c["sensitivity"] = c["tp"] / pos if pos else None
         c["specificity"] = c["tn"] / neg if neg else None
         c["sens_ci"], c["spec_ci"] = wilson(c["tp"], pos), wilson(c["tn"], neg)
+        called_pos, called_neg = c["tp"] + c["fp"], c["tn"] + c["fn"]
+        c["ppv"] = c["tp"] / called_pos if called_pos else None
+        c["npv"] = c["tn"] / called_neg if called_neg else None
+        c["ppv_ci"], c["npv_ci"] = wilson(c["tp"], called_pos), wilson(c["tn"], called_neg)
         c["n_with_reference"] = pos + neg
+        c["targets"] = target_check(c)
+        c["adjusted"] = adjusted_predictive_values(c)
         return c
     weeks = {}
     for s in sl:
@@ -248,7 +330,8 @@ def performance(request):
         "manual_n": len(manual), "histogram": hist, "trend": trend, "ai": conf("ai_grade"),
         "assisted": conf("final_grade"), "by_site": by_site,
         "overrides": sum(1 for s in sl if s.ai_grade and s.final_grade != s.ai_grade),
-        "with_ai": sum(1 for s in sl if s.ai_grade),
+        "with_ai": sum(1 for s in sl if s.ai_grade), "targets": settings_store.targets(),
+        "prevalence": settings_store.prevalence(), "modality": modality,
         "inference_median_ms": statistics.median(inf) if inf else None, "inference_p90_ms": percentile(inf, 0.9)})
 
 
@@ -257,7 +340,14 @@ def summary(request):
     sl = confirmed_slides(True, 30)
     sess = [s.session_seconds for s in sl if s.session_seconds is not None]
     manual = [s.manual_seconds for s in sl if s.manual_seconds]
+    awaiting = []
+    for s in M.Slide.objects.filter(status="confirmed", demo=False).exclude(final_grade__in=["negative", None]).order_by("-confirmed_at")[:300]:
+        st = confirm.status(s, list(s.confirmations.order_by("id")))
+        if st["state"] not in ("confirmed", "not_applicable", "overturned"):
+            awaiting.append({"id": s.id, "code": s.code, "grade": s.final_grade, "modality": s.modality,
+                             "state": st["state"], "label": st["label"]})
     return Response({
+        "awaiting_confirmation": awaiting[:12], "awaiting_confirmation_n": len(awaiting),
         "slides_30d": len(sl),
         "median_seconds": statistics.median(sess) if sess else None,
         "manual_median_seconds": statistics.median(manual) if manual else None,
@@ -265,13 +355,14 @@ def summary(request):
         "awaiting_review": M.ReviewItem.objects.filter(status__in=["open", "disputed"]).count(),
         "open_slides": M.Slide.objects.filter(status="open").count(),
         "images": M.Image.objects.filter(consent=True).count(),
-        "active_model": S.MLModelSerializer(inference.active_model()).data if inference.active_model() else None})
+        "active_model": S.MLModelSerializer(inference.active_model("zn")).data if inference.active_model("zn") else None,
+        "active_models": {k: (S.MLModelSerializer(v).data if v else None) for k, v in inference.active_models().items()}})
 
 
 @api_view(["GET"])
 def export_slides(request):
     include_demo = request.query_params.get("include_demo", "0") in ("1", "true")
-    cols = ["code", "site", "stain", "magnification", "started_by", "confirmed_by", "session_seconds", "manual_seconds",
+    cols = ["code", "site", "modality", "stain", "magnification", "started_by", "confirmed_by", "session_seconds", "manual_seconds",
             "ai_grade", "ai_bacilli", "ai_fields", "final_grade", "override_reason", "reference_result",
             "reference_method", "demo"]
     buf = io.StringIO()
